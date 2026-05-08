@@ -6,6 +6,9 @@ import Tesseract from 'tesseract.js';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
+// 🌟 ลำดับหมวดหมู่
+const CATEGORIES = ['AR', 'IN', 'EE', 'AC', 'ST', 'SN', 'ME', 'AD'];
+
 function App() {
   const [masterFile, setMasterFile] = useState(null);
   const [crFiles, setCrFiles] = useState([]); 
@@ -23,21 +26,26 @@ function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
 
   const [showOcrConfig, setShowOcrConfig] = useState(false);
-  
-  // 🌟 ตั้งค่าครอบตัด 2 ชุด
-  const [cropConfig, setCropConfig] = useState({ width: 15, height: 25 }); 
-  const [altCropConfig, setAltCropConfig] = useState({ width: 35, height: 25 }); 
+  const [cropConfig, setCropConfig] = useState({ width: 15, height: 15 }); 
+  const [altCropConfig, setAltCropConfig] = useState({ width: 25, height: 25 }); 
+
+  const [activeCategories, setActiveCategories] = useState({
+    AR: true, IN: true, EE: true, AC: true, ST: true, SN: true, ME: true, AD: false
+  });
 
   const [previewData, setPreviewData] = useState({ 
     image1: null, rawText1: '', match1: '', 
     image2: null, rawText2: '', match2: '', 
-    image3: null, rawText3: '', match3: '', // 🌟 เพิ่ม Data สำหรับก๊อก 3 (หน้าปก)
+    image3: null, rawText3: '', match3: '',
     isLoading: false 
   });
   
   const [testPageNum, setTestPageNum] = useState(1);
   const [reviewData, setReviewData] = useState(null); 
   const [manualInputs, setManualInputs] = useState({}); 
+  
+  const [resetKey, setResetKey] = useState(Date.now());
+  const [copied, setCopied] = useState(false);
 
   const logEndRef = useRef(null);
   const scrollToBottom = () => logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -45,8 +53,30 @@ function App() {
 
   const addLog = (msg) => setLogs((prev) => [...prev, msg]);
 
-  // 🌟 ฟังก์ชัน OCR ก๊อก 1 & 2 (สแกนมุมขวาล่าง หาเลขแบบ Eng)
-  const processOcrOnPage = async (pdf, pageNum, config) => {
+  const handleCopyCrNames = () => {
+    if (crFiles.length === 0) return;
+    const fileNames = crFiles.map(f => f.name).join('\n');
+    navigator.clipboard.writeText(fileNames).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000); 
+    });
+  };
+
+  const handleReset = () => {
+    setMasterFile(null);
+    setCrFiles([]);
+    setLogs([]);
+    setCrSummary([]);
+    setDownloadUrl(null);
+    setProgress(0);
+    setStats({ replaced: 0, purged: 0, appended: 0 });
+    setReviewData(null);
+    setManualInputs({});
+    setResetKey(Date.now()); 
+    setLogs(['> [SYS] SYSTEM RESET: พร้อมรับข้อมูลชุดใหม่...']);
+  };
+
+  const processOcrOnPage = async (pdf, pageNum, config, activeCats, worker = null) => {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 3.0 }); 
     const canvas = document.createElement('canvas');
@@ -68,42 +98,71 @@ function App() {
     croppedContext.drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
     
     const imageUrl = croppedCanvas.toDataURL('image/png');
-    const { data: { text } } = await Tesseract.recognize(imageUrl, 'eng', { 
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./()', 
-      tessedit_pageseg_mode: '6', 
-    });
+    
+    // เคลียร์ Canvas ทันทีเพื่อป้องกัน Memory Leak
+    canvas.width = 0; canvas.height = 0;
+    croppedCanvas.width = 0; croppedCanvas.height = 0;
 
-    let cleanText = text.replace(/\s+/g, '').toUpperCase(); 
-    cleanText = cleanText.replace(/[OQ]/g, '0'); 
-    cleanText = cleanText.replace(/[L|!]/g, 'I'); 
-    cleanText = cleanText.replace(/1N/g, 'IN');  
-    cleanText = cleanText.replace(/IM/g, 'IN');  
-    cleanText = cleanText.replace(/(AR|AD|AC|EE|IN|ME|SN|ST)D/g, '$10'); 
+    let text = "";
+    if (worker) {
+      const result = await worker.recognize(imageUrl);
+      text = result.data.text;
+    } else {
+      const result = await Tesseract.recognize(imageUrl, 'eng', { tessedit_pageseg_mode: '6' });
+      text = result.data.text;
+    }
 
-    const match = cleanText.match(/(AR|AD|AC|EE|IN|ME|SN|ST)\d*[-_.]\d+(?:[-_.]\d+)?/); 
+    let cleanText = text.toUpperCase().replace(/\s+/g, ''); 
+    
+    cleanText = cleanText.replace(/[1L|!I]N/g, 'IN');
+    cleanText = cleanText.replace(/IM/g, 'IN');
+    cleanText = cleanText.replace(/5N/g, 'SN');
+    cleanText = cleanText.replace(/5T/g, 'ST');
+    cleanText = cleanText.replace(/4R/g, 'AR');
+    cleanText = cleanText.replace(/4C/g, 'AC');
     
     let finalMatch = null;
-    if (match) {
-      const parts = match[0].split(/[-_.]/);
-      if (parts.length === 3) finalMatch = `${parts[0]}-${parts[1]}_${parts[2]}`;
-      else if (parts.length === 2) finalMatch = `${parts[0]}-${parts[1]}`;
-      else finalMatch = match[0];
+
+    if (activeCats && activeCats.length > 0) {
+      const catRegexStr = activeCats.join('|');
+      const dynamicRegex = new RegExp(`(${catRegexStr})[0-9OQDGILZSB!]{0,2}[-_.~:\\\\][0-9OQDGILZSB!]{1,3}(?:[-_.~:\\\\][0-9OQDGILZSB!]{1,2})?`); 
+      
+      const rawMatch = cleanText.match(dynamicRegex); 
+      
+      if (rawMatch) {
+        let matchedStr = rawMatch[0];
+        
+        let prefix = matchedStr.substring(0, 2); 
+        let suffix = matchedStr.substring(2);    
+        
+        suffix = suffix.replace(/[OQDG]/g, '0');
+        suffix = suffix.replace(/[IL|!]/g, '1');
+        suffix = suffix.replace(/Z/g, '2');
+        suffix = suffix.replace(/S/g, '5');
+        suffix = suffix.replace(/B/g, '8');
+        suffix = suffix.replace(/[~:\\]/g, '-'); 
+        
+        matchedStr = prefix + suffix; 
+
+        const parts = matchedStr.split(/[-_.]/);
+        if (parts.length >= 3) finalMatch = `${parts[0]}-${parts[1]}_${parts[2]}`;
+        else if (parts.length === 2) finalMatch = `${parts[0]}-${parts[1]}`;
+        else finalMatch = matchedStr;
+      }
     }
 
     return { imageUrl, cleanText, finalMatch };
   };
 
-  // 🌟 ฟังก์ชัน OCR ก๊อก 3 (สแกนครึ่งบน หาข้อความหน้าปก ไทย+Eng)
-  const processCoverOcr = async (pdf, pageNum) => {
+  const processCoverOcr = async (pdf, pageNum, worker = null) => {
     const page = await pdf.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 2.0 }); // ลด Scale ลงนิดนึงเพื่อความเร็ว เพราะตัวหนังสือหน้าปกใหญ่
+    const viewport = page.getViewport({ scale: 2.0 }); 
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
     canvas.width = viewport.width;
     canvas.height = viewport.height;
     await page.render({ canvasContext: context, viewport: viewport }).promise;
 
-    // ครอบตัดเฉพาะครึ่งบนของกระดาษ (Top 40%)
     const cropWidth = viewport.width;
     const cropHeight = viewport.height * 0.40;
     const cropX = 0;
@@ -116,13 +175,21 @@ function App() {
     croppedContext.drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
     
     const imageUrl = croppedCanvas.toDataURL('image/png');
-    // โหลด 2 ภาษา (tha+eng) เพื่อให้อ่านคำว่า "แบบและรายละเอียดการก่อสร้าง" ได้
-    const { data: { text } } = await Tesseract.recognize(imageUrl, 'tha+eng', { 
-      tessedit_pageseg_mode: '6', 
-    });
+
+    // เคลียร์ Canvas ทันทีเพื่อป้องกัน Memory Leak
+    canvas.width = 0; canvas.height = 0;
+    croppedCanvas.width = 0; croppedCanvas.height = 0;
+
+    let text = "";
+    if (worker) {
+      const result = await worker.recognize(imageUrl);
+      text = result.data.text;
+    } else {
+      const result = await Tesseract.recognize(imageUrl, 'tha+eng', { tessedit_pageseg_mode: '6' });
+      text = result.data.text;
+    }
 
     const cleanText = text.replace(/\s+/g, ''); 
-    // เช็คว่ามีคีย์เวิร์ดของหน้าปกไหม
     const isCover = /แบบและราย|การก่อสร้าง|โครงการ|เจ้าของ|SMART|CUSTOMIZE/i.test(cleanText);
 
     return { imageUrl, rawText: text, isCover };
@@ -130,10 +197,9 @@ function App() {
 
   const handleTestOcr = async () => {
     const fileToTest = masterFile || (crFiles.length > 0 ? crFiles[0] : null);
-    if (!fileToTest) {
-      alert('กรุณาอัปโหลดไฟล์ Master หรือ CR อย่างน้อย 1 ไฟล์เพื่อใช้ทดสอบครับ');
-      return;
-    }
+    if (!fileToTest) { alert('กรุณาอัปโหลดไฟล์ก่อนทดสอบครับ'); return; }
+
+    const activeCats = CATEGORIES.filter(k => activeCategories[k]);
 
     setPreviewData(prev => ({ ...prev, isLoading: true }));
     try {
@@ -145,25 +211,30 @@ function App() {
       if (targetPage > pdfjsDoc.numPages) targetPage = pdfjsDoc.numPages;
       setTestPageNum(targetPage); 
 
-      // 🌟 รันทดสอบ 3 ก๊อกพร้อมกันให้ดูผลลัพธ์
-      const res1 = await processOcrOnPage(pdfjsDoc, targetPage, cropConfig); 
-      const res2 = await processOcrOnPage(pdfjsDoc, targetPage, altCropConfig); 
+      const res1 = await processOcrOnPage(pdfjsDoc, targetPage, cropConfig, activeCats); 
+      const res2 = await processOcrOnPage(pdfjsDoc, targetPage, altCropConfig, activeCats); 
       const res3 = await processCoverOcr(pdfjsDoc, targetPage); 
       
       setPreviewData({ 
-        image1: res1.imageUrl, rawText1: res1.cleanText, match1: res1.finalMatch || '❌ หาไม่เจอ', 
-        image2: res2.imageUrl, rawText2: res2.cleanText, match2: res2.finalMatch || '❌ หาไม่เจอ', 
-        image3: res3.imageUrl, rawText3: res3.rawText.substring(0, 50) + '...', match3: res3.isCover ? '✅ หน้าปก (COVER)' : '❌ ไม่ใช่หน้าปก',
+        image1: res1.imageUrl, rawText1: res1.cleanText, match1: res1.finalMatch || 'N/A', 
+        image2: res2.imageUrl, rawText2: res2.cleanText, match2: res2.finalMatch || 'N/A', 
+        image3: res3.imageUrl, rawText3: res3.rawText.substring(0, 50) + '...', match3: res3.isCover ? 'COVER_DETECTED' : 'N/A',
         isLoading: false 
       });
     } catch (error) { 
-      console.error(error);
-      setPreviewData(prev => ({ ...prev, isLoading: false })); 
+      console.error(error); setPreviewData(prev => ({ ...prev, isLoading: false })); 
     }
   };
 
   const handleScanFiles = async () => {
     if (!masterFile || crFiles.length === 0) return;
+
+    const activeCats = CATEGORIES.filter(k => activeCategories[k]);
+    if (activeCats.length === 0) {
+      addLog('\n> [ERR] ABORT: กรุณาเปิดใช้งานหมวดหมู่ (FILTER) อย่างน้อย 1 หมวดครับ!');
+      return;
+    }
+
     setIsProcessing(true);
     setProgress(5); 
     setLogs([]);
@@ -177,64 +248,80 @@ function App() {
     const timeStr = now.toTimeString().slice(0,5).replace(/:/g, '');
     setDownloadFilename(`Updated_Master_${dateStr}_${timeStr}.pdf`);
 
+    let engWorker = null;
+    let thaEngWorker = null;
+
     try {
-      addLog('🚀 [1/6] SYSTEM INITIALIZATION: กำลังเริ่มต้นระบบ...');
+      addLog('> [SYS] INIT BATCH ALGO...');
+      addLog(`> [SYS] ACTIVE FILTERS: [${activeCats.join(', ')}]`);
+      
+      addLog(`> [DATA] INCOMING CR FILES (${crFiles.length}):`);
+      crFiles.forEach((file, index) => { addLog(`   |-- [${index + 1}] ${file.name}`); });
+
       const masterBytes = await masterFile.arrayBuffer();
       const masterPdfjs = await pdfjsLib.getDocument({ data: masterBytes.slice(0) }).promise;
 
       const crDataList = [];
+      addLog(`> [SYS] LOADING ASSETS...`);
       for (let i = 0; i < crFiles.length; i++) {
-        addLog(`   📥 LOADING: กำลังโหลดไฟล์ ${crFiles[i].name}...`);
         const crBytes = await crFiles[i].arrayBuffer();
         const crPdfjs = await pdfjsLib.getDocument({ data: crBytes.slice(0) }).promise;
         crDataList.push({ file: crFiles[i], bytes: crBytes, pdfjs: crPdfjs });
       }
 
-      addLog(`\n🤖 [2/6] TRI-PASS OCR: สแกนไฟล์ CR ด้วยระบบ 3 ก๊อก (ค้นหารหัส & หน้าปก)...`);
+      addLog(`> [SYS] INITIALIZING OCR WORKERS (THIS MAY TAKE A MOMENT)...`);
+      engWorker = await Tesseract.createWorker('eng');
+      if (engWorker.setParameters) await engWorker.setParameters({ tessedit_pageseg_mode: '6' });
+      
+      thaEngWorker = await Tesseract.createWorker('tha+eng');
+      if (thaEngWorker.setParameters) await thaEngWorker.setParameters({ tessedit_pageseg_mode: '6' });
+      addLog(`> [SYS] OCR WORKERS READY.`);
+
+      addLog(`\n> [OCR] SCANNING CR DOCUMENTS...`);
       const tempSummary = [];
       setProgress(10);
 
       for (let i = 0; i < crDataList.length; i++) {
         const crItem = crDataList[i];
+        addLog(`   |-- PROCESS CR ${i + 1}/${crDataList.length} (PAGES: ${crItem.pdfjs.numPages})`);
         for (let c = 1; c <= crItem.pdfjs.numPages; c++) {
-          
-          let dwgNo = null;
-          let usedAlt = false;
-          let isCover = false;
+          try {
+            let dwgNo = null;
+            let usedAlt = false;
+            let isCover = false;
 
-          // 🌟 ก๊อก 1
-          let result = await processOcrOnPage(crItem.pdfjs, c, cropConfig);
-          dwgNo = result.finalMatch;
-
-          // 🌟 ก๊อก 2
-          if (!dwgNo) {
-            result = await processOcrOnPage(crItem.pdfjs, c, altCropConfig);
+            // ส่ง engWorker ไปเพื่อ Reuse 
+            let result = await processOcrOnPage(crItem.pdfjs, c, cropConfig, activeCats, engWorker);
             dwgNo = result.finalMatch;
-            usedAlt = true;
-          }
 
-          // 🌟 ก๊อก 3 (หาหน้าปก)
-          if (!dwgNo) {
-            const coverRes = await processCoverOcr(crItem.pdfjs, c);
-            if (coverRes.isCover) {
-              dwgNo = 'COVER';
-              isCover = true;
+            if (!dwgNo) {
+              result = await processOcrOnPage(crItem.pdfjs, c, altCropConfig, activeCats, engWorker);
+              dwgNo = result.finalMatch;
+              usedAlt = true;
             }
-          }
 
-          if (dwgNo) {
-            const baseNo = dwgNo === 'COVER' ? 'COVER' : dwgNo.split('_')[0]; 
-            const existingIdx = tempSummary.findIndex(item => item.baseNo === baseNo);
-            
-            if (existingIdx !== -1) {
-              tempSummary[existingIdx] = { dwgNo, baseNo, crPageIndex: c - 1, crFileIndex: i, status: 'searching' };
+            if (!dwgNo) {
+              // ส่ง thaEngWorker ไป
+              const coverRes = await processCoverOcr(crItem.pdfjs, c, thaEngWorker);
+              if (coverRes.isCover) { dwgNo = 'COVER'; isCover = true; }
+            }
+
+            if (dwgNo) {
+              const baseNo = dwgNo === 'COVER' ? 'COVER' : dwgNo.split('_')[0]; 
+              const existingIdx = tempSummary.findIndex(item => item.baseNo === baseNo);
+              
+              if (existingIdx !== -1) {
+                tempSummary[existingIdx] = { dwgNo, baseNo, crPageIndex: c - 1, crFileIndex: i, status: 'searching' };
+              } else {
+                tempSummary.push({ dwgNo, baseNo, crPageIndex: c - 1, crFileIndex: i, status: 'searching' });
+                if (isCover) addLog(`       [+] DETECTED: COVER_PAGE`);
+                else addLog(`       [+] DETECTED: ${dwgNo} ${usedAlt ? '(CH:2)' : ''}`);
+              }
             } else {
-              tempSummary.push({ dwgNo, baseNo, crPageIndex: c - 1, crFileIndex: i, status: 'searching' });
-              if (isCover) addLog(`      ✅ ดึงข้อมูล CR สำเร็จ: พบหน้าปก (COVER)`);
-              else addLog(`      ✅ ดึงข้อมูล CR สำเร็จ: ${dwgNo} ${usedAlt ? '(ก๊อก 2)' : ''}`);
+              addLog(`       [-] SKIP: P.${c} (NO_MATCH / EXCLUDED)`);
             }
-          } else {
-            addLog(`      ⏩ ข้ามหน้า ${c} ของ CR (สแกนทั้ง 3 ก๊อกแล้วไม่พบรหัสหรือปก)`);
+          } catch (pageErr) {
+            addLog(`       [ERR] P.${c} FAILED: ${pageErr.message}`);
           }
           setProgress(10 + Math.round(((i / crDataList.length) + (c / crItem.pdfjs.numPages / crDataList.length)) * 25));
         }
@@ -242,74 +329,73 @@ function App() {
       setCrSummary([...tempSummary]);
 
       if (tempSummary.length === 0) {
-        addLog('\n❌ ABORT: ยกเลิกการทำงาน ไม่พบเลขแบบก่อสร้างในไฟล์ CR ที่แนบมาครับ');
+        addLog('\n> [ERR] ABORT: NO VALID DRAWING ID FOUND.');
         setIsProcessing(false); setProgress(0); return;
       }
 
-      addLog(`\n🔍 [3/6] MASTER INDEXING: สแกน Master (${masterPdfjs.numPages} หน้า) เพื่อค้นหาเป้าหมาย...`);
+      addLog(`\n> [IDX] MAPPING MASTER PDF (PAGES: ${masterPdfjs.numPages})...`);
       const masterIndicesMap = {}; 
       const pagesToDelete = []; 
       
       for (let m = 1; m <= masterPdfjs.numPages; m++) {
-        if (m % 10 === 0 || m === 1) addLog(`   ⏳ สแกน Master... ${Math.round((m/masterPdfjs.numPages)*100)}%`);
+        if (m % 10 === 0 || m === 1) addLog(`   |-- SCANNING... ${Math.round((m/masterPdfjs.numPages)*100)}%`);
         
-        let dwgNo = null;
-        let isCover = false;
+        try {
+          let dwgNo = null;
+          let isCover = false;
 
-        // 🌟 ก๊อก 1
-        let result = await processOcrOnPage(masterPdfjs, m, cropConfig);
-        dwgNo = result.finalMatch;
-
-        // 🌟 ก๊อก 2
-        if (!dwgNo) {
-          result = await processOcrOnPage(masterPdfjs, m, altCropConfig);
+          let result = await processOcrOnPage(masterPdfjs, m, cropConfig, activeCats, engWorker);
           dwgNo = result.finalMatch;
-        }
 
-        // 🌟 ก๊อก 3 (หาหน้าปกใน Master)
-        if (!dwgNo) {
-          const coverRes = await processCoverOcr(masterPdfjs, m);
-          if (coverRes.isCover) {
-            dwgNo = 'COVER';
-            isCover = true;
-            addLog(`   🛡️ พบหน้าปก (COVER) ที่ Master หน้า ${m} -> ป้องกันการลบทิ้งอัตโนมัติ`);
+          if (!dwgNo) {
+            result = await processOcrOnPage(masterPdfjs, m, altCropConfig, activeCats, engWorker);
+            dwgNo = result.finalMatch;
           }
-        }
 
-        if (dwgNo) {
-          const baseNo = dwgNo === 'COVER' ? 'COVER' : dwgNo.split('_')[0]; 
-          masterIndicesMap[baseNo] = m - 1; 
-          
-          const foundIndex = tempSummary.findIndex(item => item.baseNo === baseNo);
-          if (foundIndex !== -1) {
-            tempSummary[foundIndex].status = 'success';
-            setCrSummary([...tempSummary]); 
-            addLog(`   🎯 เจอคู่แมตช์! [${tempSummary[foundIndex].dwgNo}] -> จะแทนที่ Master หน้า ${m}`);
+          if (!dwgNo) {
+            const coverRes = await processCoverOcr(masterPdfjs, m, thaEngWorker);
+            if (coverRes.isCover) { dwgNo = 'COVER'; isCover = true; addLog(`       [LOCKED] COVER AT P.${m}`); }
           }
-        } else {
-          // ถ้า 3 ก๊อกหาไม่เจอจริงๆ ถึงจะเอาไปรอประหาร (ลบทิ้ง)
-          pagesToDelete.push(m - 1);
-          addLog(`   🗑️ เตรียมลบทิ้ง: หน้า ${m} (สแกน 3 ก๊อกไม่พบข้อมูล)`);
+
+          if (dwgNo) {
+            const baseNo = dwgNo === 'COVER' ? 'COVER' : dwgNo.split('_')[0]; 
+            masterIndicesMap[baseNo] = m - 1; 
+            
+            const foundIndex = tempSummary.findIndex(item => item.baseNo === baseNo);
+            if (foundIndex !== -1) {
+              tempSummary[foundIndex].status = 'success';
+              setCrSummary([...tempSummary]); 
+              addLog(`       [MATCH] ${tempSummary[foundIndex].dwgNo} -> TARGET P.${m}`);
+            }
+          } else {
+            pagesToDelete.push(m - 1);
+            addLog(`       [DROP] QUEUED P.${m} (NO_MATCH / EXCLUDED)`);
+          }
+        } catch (pageErr) {
+           pagesToDelete.push(m - 1);
+           addLog(`       [ERR] P.${m} FAILED TO READ: ${pageErr.message}`);
         }
         setProgress(35 + Math.round((m / masterPdfjs.numPages) * 15));
       }
 
       if (pagesToDelete.length > 0) {
-        addLog(`\n⏸️ SYSTEM PAUSED: รอการตรวจสอบและยืนยันจากผู้ใช้งาน...`);
+        addLog(`\n> [SYS] PAUSED FOR PRE-FLIGHT CHECK...`);
         setReviewData({ tempSummary, masterIndicesMap, pagesToDelete, masterBytes, crDataList });
         setProgress(50);
       } else {
-        // ถ้าไม่มีหน้าขยะให้ตรวจ ก็รันต่อให้จบเลย
         await executeFinalPhase({ tempSummary, masterIndicesMap, pagesToDelete, masterBytes, crDataList }, {});
       }
 
     } catch (e) { 
-      addLog(`\n🚨 CRITICAL ERROR: ${e.message}`); 
+      addLog(`\n> [FATAL] ${e.message}`); 
       setIsProcessing(false); setProgress(0);
+    } finally {
+      // ทำลาย Worker ทิ้งเพื่อคืน Memory 
+      if (engWorker && engWorker.terminate) await engWorker.terminate();
+      if (thaEngWorker && thaEngWorker.terminate) await thaEngWorker.terminate();
     }
   };
 
-  // 🌟 ฟังก์ชันสำหรับทำงานต่อหลังตรวจหน้าขยะ
   const executeFinalPhase = async (data, userInputs) => {
     try {
       let finalMasterMap = { ...data.masterIndicesMap };
@@ -328,9 +414,9 @@ function App() {
           const sumIdx = finalTempSummary.findIndex(item => item.baseNo === baseNo);
           if (sumIdx !== -1 && finalTempSummary[sumIdx].status === 'searching') {
             finalTempSummary[sumIdx].status = 'success';
-            addLog(`   🎯 MANUAL MATCH: บังคับจับคู่ [${finalTempSummary[sumIdx].dwgNo}] กับ Master หน้า ${pIdx + 1}`);
+            addLog(`       [FORCE_MATCH] ${finalTempSummary[sumIdx].dwgNo} -> P.${pIdx + 1}`);
           } else {
-            addLog(`   💾 MANUAL SAVE: ป้องกันการลบหน้า ${pIdx + 1} (ระบุเป็น: ${dwgNo})`);
+            addLog(`       [FORCE_SAVE] P.${pIdx + 1} AS ${dwgNo}`);
           }
         }
       });
@@ -341,20 +427,17 @@ function App() {
              item.status = 'success';
           } else {
              item.status = 'new_append';
-             addLog(`   🆕 ไม่พบรหัส ${item.baseNo} ใน Master -> เตรียมเพิ่มเป็นแบบใหม่`);
+             addLog(`       [NEW_ENTRY] ${item.baseNo} -> QUEUED APPEND`);
           }
         }
       });
       setCrSummary([...finalTempSummary]); 
       setProgress(60);
 
-      addLog('\n✂️ [4/6] BATCH REPLACEMENT: กำลังผ่าตัดสลับหน้า (Replace)...');
+      addLog('\n> [EXEC] EXECUTING REPLACEMENTS...');
       const masterDoc = await PDFDocument.load(data.masterBytes);
-      
       const loadedCrDocs = [];
-      for (let i = 0; i < data.crDataList.length; i++) {
-        loadedCrDocs.push(await PDFDocument.load(data.crDataList[i].bytes));
-      }
+      for (let i = 0; i < data.crDataList.length; i++) { loadedCrDocs.push(await PDFDocument.load(data.crDataList[i].bytes)); }
 
       let replacedCount = 0;
       for (const item of finalTempSummary) {
@@ -369,20 +452,18 @@ function App() {
       }
       setProgress(80);
 
-      addLog(`\n🧹 [5/6] AUTO-PURGE: กำลังลบหน้าขยะ... ลบทิ้งทั้งหมด ${finalPagesToDelete.length} แผ่น`);
+      addLog(`> [EXEC] EXECUTING PURGE (${finalPagesToDelete.length} ITEMS)...`);
       finalPagesToDelete.sort((a, b) => b - a);
-      for (const idx of finalPagesToDelete) {
-        masterDoc.removePage(idx);
-      }
+      for (const idx of finalPagesToDelete) { masterDoc.removePage(idx); }
       setProgress(90);
 
       const newPages = finalTempSummary.filter(item => item.status === 'new_append');
       let appendedCount = 0;
       
       if (newPages.length > 0) {
-        addLog(`\n➕ [6/6] AUTO-APPEND: กำลังเพิ่มและจัดเรียงแบบใหม่ (${newPages.length} แผ่น)...`);
-        const categoryOrder = ['COVER', 'AR', 'IN', 'EE', 'AC', 'ST', 'ME', 'SN', 'AD'];
+        addLog(`> [EXEC] EXECUTING APPEND & SORT (${newPages.length} ITEMS)...`);
         
+        const categoryOrder = ['COVER', 'AR', 'IN', 'EE', 'AC', 'ST', 'SN', 'ME', 'AD'];
         newPages.sort((a, b) => {
           const prefixA = a.dwgNo === 'COVER' ? 'COVER' : (a.dwgNo.match(/^[A-Z]+/) || [''])[0];
           const prefixB = b.dwgNo === 'COVER' ? 'COVER' : (b.dwgNo.match(/^[A-Z]+/) || [''])[0];
@@ -395,15 +476,10 @@ function App() {
         for (const item of newPages) {
           const crDoc = loadedCrDocs[item.crFileIndex];
           const [crPage] = await masterDoc.copyPages(crDoc, [item.crPageIndex]);
-          
-          // ถ้าเป็นปกใหม่ที่เพิ่มเข้ามา ให้เอาไปไว้หน้าแรกสุดเลย
-          if (item.dwgNo === 'COVER') {
-             masterDoc.insertPage(0, crPage);
-          } else {
-             masterDoc.addPage(crPage); 
-          }
+          if (item.dwgNo === 'COVER') { masterDoc.insertPage(0, crPage); } 
+          else { masterDoc.addPage(crPage); }
           appendedCount++;
-          addLog(`   ➕ เพิ่มสำเร็จ: [${item.dwgNo}]`);
+          addLog(`       [+] APPENDED: ${item.dwgNo}`);
         }
       }
       
@@ -411,16 +487,15 @@ function App() {
       setProgress(100);
 
       if (replacedCount > 0 || finalPagesToDelete.length > 0 || appendedCount > 0) {
-        addLog(`\n🎉 OPERATION COMPLETE: ดำเนินการเสร็จสมบูรณ์!`);
+        addLog(`\n> [SYS] OPERATION COMPLETED SUCCESSFULLY.`);
         const finalBytes = await masterDoc.save();
         setDownloadUrl(URL.createObjectURL(new Blob([finalBytes], { type: 'application/pdf' })));
-        addLog('✅ สร้างไฟล์ Master อัปเดตสำเร็จ พร้อมให้ดาวน์โหลดแล้วครับ');
       } else {
-        addLog('\n🚨 ZERO MODIFICATIONS: ไม่มีการแก้ไขไฟล์ใดๆ เกิดขึ้น');
+        addLog('\n> [SYS] ZERO MODIFICATIONS APPLIED.');
       }
 
     } catch (e) { 
-      addLog(`\n🚨 CRITICAL ERROR: ระบบขัดข้อง: ${e.message}`); 
+      addLog(`\n> [FATAL] ${e.message}`); 
       setProgress(0);
     }
     finally { setIsProcessing(false); }
@@ -428,7 +503,7 @@ function App() {
 
   const handleConfirmExecute = () => {
     setReviewData(null); 
-    addLog('\n✅ USER CONFIRMED: นำข้อมูลที่ยืนยันมาประมวลผลต่อ...');
+    addLog('\n> [SYS] PRE-FLIGHT CONFIRMED. RESUMING...');
     executeFinalPhase(reviewData, manualInputs);
   };
 
@@ -436,19 +511,19 @@ function App() {
     const reportContent = `===========================================
 PDF BATCH REPLACER - EXECUTION REPORT
 ===========================================
-Generated: ${new Date().toLocaleString('th-TH')}
+Generated: ${new Date().toLocaleString('en-US')}
 System Auth: @The Toi
 
 --- SUMMARY STATISTICS ---
-✅ Replaced (สลับทับหน้าเดิม): ${stats.replaced} แผ่น
-➕ Appended (เพิ่มแบบใหม่ต่อท้าย): ${stats.appended} แผ่น
-🗑️ Purged (ลบหน้าปก/ขยะทิ้ง): ${stats.purged} แผ่น
+[UPDATE] Replaced: ${stats.replaced}
+[INSERT] Appended: ${stats.appended}
+[DELETE] Purged: ${stats.purged}
 
 --- DRAWING STATUS ---
 ${crSummary.map(item => {
   let stat = '';
-  if(item.status === 'success') stat = '[REPLACED]';
-  else if(item.status === 'new_append') stat = '[APPENDED]';
+  if(item.status === 'success') stat = '[UPDATED]';
+  else if(item.status === 'new_append') stat = '[INSERTED]';
   else stat = '[ERROR]';
   return `- ${item.dwgNo.padEnd(15)} : ${stat}`;
 }).join('\n')}
@@ -467,157 +542,221 @@ ${logs.join('\n')}
   };
 
   return (
-    <div className={isDarkMode ? 'theme-dark' : 'theme-light'} style={{ display: 'flex', justifyContent: 'center', height: '100vh', backgroundColor: 'var(--bg-app)', color: 'var(--text-main)', paddingTop: '40px', paddingBottom: '20px', transition: 'background-color 0.3s ease' }}>
+    <div className={isDarkMode ? 'theme-dark' : 'theme-light'} style={{ display: 'flex', justifyContent: 'center', height: '100vh', backgroundColor: 'var(--bg-app)', color: 'var(--text-main)', paddingTop: '30px', paddingBottom: '20px', transition: 'background-color 0.2s' }}>
       <style>
         {`
-          @import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+          @import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700;800&display=swap');
           
           :root {}
-          .theme-dark { --bg-app: #020617; --bg-panel: #0f172a; --text-main: #f8fafc; --text-muted: #94a3b8; --border-color: #1e293b; --upload-bg: #020617; --upload-border: #334155; }
-          .theme-light { --bg-app: #f1f5f9; --bg-panel: #ffffff; --text-main: #0f172a; --text-muted: #64748b; --border-color: #e2e8f0; --upload-bg: #f8fafc; --upload-border: #cbd5e1; }
+          .theme-dark { 
+            --bg-app: #0b0e11; 
+            --bg-panel: #181a20; 
+            --text-main: #eaecef; 
+            --text-muted: #848e9c; 
+            --border-color: #2b3139; 
+            --upload-bg: #0b0e11; 
+            --color-up: #0ecb81; 
+            --color-down: #f6465d; 
+            --color-primary: #2962ff; 
+            --color-warning: #fcd535; 
+          }
+          .theme-light { 
+            --bg-app: #f1f5f9; 
+            --bg-panel: #ffffff; 
+            --text-main: #0f172a; 
+            --text-muted: #334155; 
+            --border-color: #cbd5e1; 
+            --upload-bg: #f8fafc;
+            --color-up: #047857; 
+            --color-down: #b91c1c; 
+            --color-primary: #1d4ed8; 
+            --color-warning: #b45309; 
+          }
           
           * { box-sizing: border-box; }
-          body, html { margin: 0; padding: 0; height: 100%; font-family: 'Prompt', sans-serif; overflow: hidden; }
-          .glass-panel { background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 12px; position: relative; transition: all 0.3s ease; }
+          body, html { margin: 0; padding: 0; height: 100%; font-family: 'JetBrains Mono', 'Prompt', sans-serif; overflow: hidden; }
           
-          .upload-box { transition: all 0.3s ease; border: 1px dashed var(--upload-border); background: var(--upload-bg); position: relative; }
-          .upload-box:hover { border-color: #3b82f6; background: var(--bg-panel); }
-          .upload-box.drag-active { border-color: #10b981 !important; background: rgba(16, 185, 129, 0.05) !important; transform: scale(1.02); }
+          .glass-panel { background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 4px; position: relative; }
           
-          .btn-run { background: linear-gradient(135deg, #2563eb, #4f46e5); transition: all 0.2s; box-shadow: 0 4px 15px rgba(37, 99, 235, 0.2); }
-          .btn-run:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(37, 99, 235, 0.4); }
-          .btn-run:disabled { background: var(--border-color); color: var(--text-muted); box-shadow: none; cursor: not-allowed; }
+          .upload-box { transition: all 0.2s; border: 1px dashed var(--border-color); background: var(--upload-bg); position: relative; border-radius: 4px; }
+          .upload-box:hover { border-color: var(--color-primary); background: var(--bg-panel); }
+          .upload-box.drag-active { border-color: var(--color-up) !important; background: rgba(4, 120, 87, 0.05) !important; }
           
-          .btn-secondary { background: #334155; transition: all 0.2s; border: 1px solid #475569; color: #f8fafc; }
-          .theme-light .btn-secondary { background: #e2e8f0; border-color: #cbd5e1; color: #0f172a; }
-          .theme-light .btn-secondary:hover { background: #cbd5e1; }
-          .btn-secondary:hover { background: #475569; }
+          .btn-run { background: var(--color-primary); transition: all 0.2s; border-radius: 4px; text-transform: uppercase; font-family: 'JetBrains Mono', monospace; }
+          .btn-run:hover:not(:disabled) { background: #1e4bd8; }
+          .btn-run:active:not(:disabled) { transform: scale(0.98); }
+          .btn-run:disabled { background: var(--border-color); color: var(--text-muted); cursor: not-allowed; }
           
-          .btn-tool { background: transparent; border: 1px solid var(--border-color); color: var(--text-muted); padding: 4px 12px; border-radius: 6px; font-size: 0.7rem; cursor: pointer; transition: all 0.2s; font-family: 'Prompt', sans-serif; font-weight: 600; }
-          .btn-tool:hover { background: var(--border-color); color: var(--text-main); }
-          .btn-tool.active { border-color: #3b82f6; color: #3b82f6; background: rgba(59, 130, 246, 0.1); }
+          .btn-secondary { background: transparent; transition: all 0.2s; border: 1px solid var(--border-color); color: var(--text-main); border-radius: 4px; }
+          .btn-secondary:hover { background: var(--border-color); }
           
-          .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); display: flex; justify-content: center; alignItems: center; z-index: 999; animation: fadeIn 0.2s ease-out; }
-          .modal-content { background: var(--bg-panel); border: 1px solid var(--border-color); color: var(--text-main); border-radius: 16px; padding: 30px; width: 90%; max-width: 650px; box-shadow: 0 25px 50px rgba(0,0,0,0.4); position: relative; max-height: 90vh; overflow-y: auto; }
-          .modal-close { position: absolute; top: 16px; right: 20px; background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; transition: color 0.2s; }
+          .btn-tool { background: transparent; border: 1px solid var(--border-color); color: var(--text-muted); padding: 6px 12px; border-radius: 4px; font-size: 0.85rem; cursor: pointer; transition: all 0.2s; font-family: 'JetBrains Mono', 'Prompt', sans-serif; }
+          .btn-tool:hover { border-color: var(--text-muted); color: var(--text-main); }
+          .btn-tool.active { border-color: var(--color-primary); color: var(--color-primary); }
+          
+          .btn-reset { color: var(--color-down) !important; border-color: rgba(185, 28, 28, 0.3) !important; }
+          .btn-reset:hover { background: rgba(185, 28, 28, 0.1) !important; border-color: var(--color-down) !important; }
+
+          .btn-ocr { color: var(--color-up) !important; border-color: rgba(4, 120, 87, 0.3) !important; }
+          .btn-ocr:hover { background: rgba(4, 120, 87, 0.1) !important; border-color: var(--color-up) !important; }
+
+          .cat-toggle {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            transition: all 0.2s;
+          }
+          .cat-toggle.active {
+            background: rgba(14, 203, 129, 0.15); 
+            color: var(--color-up);
+            border-color: var(--color-up);
+          }
+          .theme-light .cat-toggle.active { background: rgba(4, 120, 87, 0.1); }
+          
+          .cat-toggle.inactive {
+            background: rgba(246, 70, 93, 0.1); 
+            color: var(--color-down);
+            border-color: var(--color-down);
+            opacity: 0.6;
+            text-decoration: line-through;
+          }
+          .theme-light .cat-toggle.inactive { background: rgba(185, 28, 28, 0.05); }
+          
+          .cat-toggle:hover:not(:disabled) {
+            transform: translateY(-1px);
+            opacity: 1;
+          }
+          .cat-toggle:disabled { cursor: not-allowed; opacity: 0.4; }
+
+          .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(11, 14, 17, 0.85); backdrop-filter: blur(2px); display: flex; justify-content: center; alignItems: center; z-index: 999; }
+          .modal-content { background: var(--bg-panel); border: 1px solid var(--border-color); color: var(--text-main); border-radius: 4px; padding: 24px; width: 90%; max-width: 700px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); position: relative; max-height: 90vh; overflow-y: auto; }
+          .modal-close { position: absolute; top: 12px; right: 16px; background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; }
           .modal-close:hover { color: var(--text-main); }
           
-          @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-          .terminal-scroll::-webkit-scrollbar { width: 6px; }
-          .terminal-scroll::-webkit-scrollbar-track { background: transparent; }
-          .terminal-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+          .terminal-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+          .terminal-scroll::-webkit-scrollbar-track { background: var(--bg-app); }
+          .terminal-scroll::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+          .terminal-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
           
-          @keyframes pulse-yellow { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-          .status-searching { animation: pulse-yellow 1.5s infinite; }
+          @keyframes pulse-yellow { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+          .status-searching { animation: pulse-yellow 1.5s infinite; border-left: 3px solid var(--color-warning) !important; }
           
-          input[type=file]::file-selector-button { border: none; background: #334155; padding: 6px 14px; border-radius: 6px; color: #f8fafc; cursor: pointer; font-family: 'Prompt', sans-serif; font-size: 0.75rem; margin-right: 12px; transition: background .2s ease-in-out; font-weight: 500; }
-          .theme-light input[type=file]::file-selector-button { background: #e2e8f0; color: #0f172a; }
-          .theme-light input[type=file]::file-selector-button:hover { background: #cbd5e1; }
-          input[type=file]::file-selector-button:hover { background: #475569; }
+          input[type=file]::file-selector-button { border: none; background: var(--border-color); padding: 6px 14px; border-radius: 2px; color: var(--text-main); cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-right: 12px; }
+          input[type=file]::file-selector-button:hover { background: var(--text-muted); color: #fff; }
 
           input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; }
-          input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 16px; width: 16px; border-radius: 50%; background: #3b82f6; cursor: pointer; margin-top: -6px; }
-          input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; cursor: pointer; background: #334155; border-radius: 2px; }
+          input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 14px; width: 14px; border-radius: 0; background: var(--color-primary); cursor: pointer; margin-top: -5px; }
+          input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; cursor: pointer; background: var(--border-color); }
 
-          .manual-input { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-app); color: var(--text-main); font-family: 'Prompt', sans-serif; font-size: 0.8rem; transition: border-color 0.2s; }
-          .manual-input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+          .manual-input { flex: 1; padding: 8px 12px; border-radius: 2px; border: 1px solid var(--border-color); background: var(--bg-app); color: var(--text-main); font-family: 'JetBrains Mono', monospace; font-size: 0.95rem; }
+          .manual-input:focus { outline: none; border-color: var(--color-primary); }
+          
+          .badge-primary { background: var(--color-primary); color: #fff; font-size: 0.75rem; padding: 4px 8px; border-radius: 2px; font-weight: 700; }
         `}
       </style>
 
-      {/* 🌟 Modal: ตรวจสอบและยืนยันก่อนลบ (Pre-Flight Check) */}
+      {/* 🌟 Modal: ตรวจสอบและยืนยันก่อนลบ (Pre-Flight Check) เพิ่มชื่อไฟล์ MASTER */}
       {reviewData && (
         <div className="modal-overlay">
-          <div className="modal-content" style={{ maxWidth: '700px' }}>
-            <h2 style={{ margin: '0 0 16px 0', fontSize: '1.3rem', color: '#facc15', display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <span>🛡️</span> ตรวจสอบความถูกต้องก่อนแก้ไขไฟล์
+          <div className="modal-content" style={{ maxWidth: '750px' }}>
+            <h2 style={{ margin: '0 0 16px 0', fontSize: '1.3rem', color: 'var(--color-warning)', display: 'flex', alignItems: 'center', gap: '8px', fontFamily: "'JetBrains Mono', 'Prompt', sans-serif" }}>
+              <span>⚠️</span> SYSTEM.PRE_FLIGHT_CHECK
             </h2>
-            <div style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: '20px', lineHeight: '1.6' }}>
-              AI สแกนไฟล์ Master เสร็จสิ้น! ตรวจพบหน้าที่ <b>หาเลขแบบไม่เจอ</b> จำนวน {reviewData.pagesToDelete.length} หน้า ซึ่งระบบเตรียมจะ <b>"ลบทิ้งอัตโนมัติ"</b><br/>
-              หากหน้าไหนดังกล่าวเป็นแบบก่อสร้างที่แท้จริง <b>โปรดพิมพ์เลขแบบลงในช่องว่าง เพื่อดึงกลับมาใช้จับคู่ครับ</b>
+            <div style={{ fontSize: '0.95rem', color: 'var(--text-muted)', marginBottom: '20px', fontFamily: "'Prompt', sans-serif" }}>
+              ตรวจพบหน้าที่ <b>หาเลขแบบไม่เจอ (หรือถูกปิด FILTER ไว้)</b><br/>
+              จากไฟล์ MASTER: <span style={{ color: 'var(--color-primary)', fontWeight: 'bold' }}>{masterFile?.name}</span><br/>
+              จำนวน <span style={{ color: 'var(--color-down)', fontWeight: 'bold' }}>{reviewData.pagesToDelete.length}</span> รายการ ซึ่งจะถูก <b>Drop (ลบทิ้ง)</b><br/>
+              หากต้องการบังคับบันทึก (Force Save) ให้กรอก ID ในช่องว่าง
             </div>
-            <div className="terminal-scroll" style={{ maxHeight: '280px', overflowY: 'auto', backgroundColor: 'var(--bg-app)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '24px' }}>
+            <div className="terminal-scroll" style={{ maxHeight: '350px', overflowY: 'auto', backgroundColor: 'var(--bg-app)', padding: '16px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
               {reviewData.pagesToDelete.length === 0 ? (
-                <div style={{ color: '#10b981', textAlign: 'center', padding: '20px', fontWeight: 'bold' }}>✅ ยอดเยี่ยม! ไม่พบหน้าขยะที่ต้องลบทิ้ง</div>
+                <div style={{ color: 'var(--color-up)', textAlign: 'center', padding: '20px', fontWeight: 'bold', fontSize: '1rem' }}>ALL CLEAR. NO ORPHANED PAGES.</div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   {reviewData.pagesToDelete.map(pIdx => (
-                    <div key={pIdx} style={{ display: 'flex', alignItems: 'center', gap: '12px', background: 'var(--bg-panel)', padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                      <span style={{ color: '#facc15', fontWeight: 'bold', width: '90px' }}>🗑️ หน้า {pIdx + 1}</span>
-                      <span style={{ color: 'var(--text-muted)' }}>👉</span>
-                      <input type="text" className="manual-input" placeholder="เว้นว่างเพื่อลบทิ้ง / พิมพ์เลขแบบเพื่อเซฟ (เช่น IN0-01)" value={manualInputs[pIdx] || ''} onChange={(e) => setManualInputs({...manualInputs, [pIdx]: e.target.value.toUpperCase()})} />
+                    <div key={pIdx} style={{ display: 'flex', alignItems: 'center', gap: '16px', background: 'var(--bg-panel)', padding: '10px 16px', border: '1px solid var(--border-color)' }}>
+                      {/* 🌟 แสดงว่าเป็นหน้าจากไฟล์ MASTER */}
+                      <span style={{ color: 'var(--color-down)', fontWeight: 'bold', width: '130px', fontSize: '0.9rem' }}>P.{pIdx + 1} (MASTER)</span>
+                      <span style={{ color: 'var(--text-muted)' }}>{'>'}</span>
+                      <input type="text" className="manual-input" placeholder="EMPTY = DROP / INPUT ID = SAVE" value={manualInputs[pIdx] || ''} onChange={(e) => setManualInputs({...manualInputs, [pIdx]: e.target.value.toUpperCase()})} />
                     </div>
                   ))}
                 </div>
               )}
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <button className="btn-secondary" onClick={() => { setReviewData(null); setIsProcessing(false); setProgress(0); addLog('\n🛑 CANCELED: ผู้ใช้ยกเลิกการประมวลผล กลับสู่โหมดเตรียมพร้อม'); }} style={{ padding: '10px 24px', borderRadius: '8px', fontWeight: '600', fontSize: '0.9rem', cursor: 'pointer' }}>ยกเลิก (Cancel)</button>
-              <button className="btn-run" onClick={handleConfirmExecute} style={{ padding: '10px 24px', borderRadius: '8px', border: 'none', color: '#fff', fontWeight: '700', cursor: 'pointer', fontSize: '0.9rem' }}>⚡ ยืนยันและดำเนินการ (Confirm)</button>
+              <button className="btn-secondary" onClick={() => { setReviewData(null); setIsProcessing(false); setProgress(0); addLog('> [SYS] ABORTED.'); }} style={{ padding: '8px 24px', fontSize: '0.9rem', cursor: 'pointer', fontWeight: 'bold' }}>CANCEL</button>
+              <button className="btn-run" onClick={handleConfirmExecute} style={{ padding: '8px 24px', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '0.9rem', fontWeight: 'bold' }}>CONFIRM EXECUTE</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* 🌟 Modal ตั้งค่าและทดสอบ OCR (เพิ่มกล้อง 3) */}
+      {/* Modal ตั้งค่าและทดสอบ OCR */}
       {showOcrConfig && (
         <div className="modal-overlay" onClick={() => setShowOcrConfig(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '900px' }}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '950px' }}>
             <button className="modal-close" onClick={() => setShowOcrConfig(false)}>✖</button>
-            <h2 style={{ margin: '0 0 20px 0', fontSize: '1.2rem', color: '#10b981', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span>⚙️</span> ตั้งค่าขอบเขตการสแกน (Tri-Pass OCR)
+            <h2 style={{ margin: '0 0 20px 0', fontSize: '1.3rem', color: 'var(--color-up)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span>⚙️</span> OCR_CONFIG.PARAMETERS
             </h2>
-            <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '20px' }}>
-              ระบบจะสแกนด้วย "กรอบหลัก" ➡️ "กรอบสำรอง" ➡️ "หาหน้าปก (สแกนภาษาไทย)" ตามลำดับอัตโนมัติ
-            </div>
             
-            <div style={{ display: 'flex', gap: '20px', marginBottom: '20px', flexWrap: 'wrap' }}>
-              <div style={{ flex: 1, minWidth: '250px', background: 'var(--bg-app)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                <strong style={{ color: '#34d399', display: 'block', marginBottom: '10px' }}>🎯 กรอบหลัก (Main)</strong>
-                <div style={{ marginBottom: '10px' }}><label style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)', fontSize: '0.8rem' }}>ความกว้าง: {cropConfig.width}%</label><input type="range" min="5" max="50" value={cropConfig.width} onChange={(e) => setCropConfig({...cropConfig, width: parseInt(e.target.value)})} /></div>
-                <div><label style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)', fontSize: '0.8rem' }}>ความสูง: {cropConfig.height}%</label><input type="range" min="5" max="50" value={cropConfig.height} onChange={(e) => setCropConfig({...cropConfig, height: parseInt(e.target.value)})} /></div>
+            <div style={{ display: 'flex', gap: '16px', marginBottom: '20px', flexWrap: 'wrap' }}>
+              <div style={{ flex: 1, minWidth: '220px', background: 'var(--bg-app)', padding: '16px', border: '1px solid var(--border-color)' }}>
+                <strong style={{ color: 'var(--color-up)', display: 'block', marginBottom: '12px', fontSize: '0.9rem' }}>CH:1 (MAIN)</strong>
+                <div style={{ marginBottom: '12px' }}><label style={{ display: 'block', marginBottom: '6px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>WIDTH: {cropConfig.width}%</label><input type="range" min="5" max="50" value={cropConfig.width} onChange={(e) => setCropConfig({...cropConfig, width: parseInt(e.target.value)})} /></div>
+                <div><label style={{ display: 'block', marginBottom: '6px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>HEIGHT: {cropConfig.height}%</label><input type="range" min="5" max="50" value={cropConfig.height} onChange={(e) => setCropConfig({...cropConfig, height: parseInt(e.target.value)})} /></div>
               </div>
-              <div style={{ flex: 1, minWidth: '250px', background: 'var(--bg-app)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                <strong style={{ color: '#c4b5fd', display: 'block', marginBottom: '10px' }}>🚑 กรอบสำรอง (Fallback)</strong>
-                <div style={{ marginBottom: '10px' }}><label style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)', fontSize: '0.8rem' }}>ความกว้าง: {altCropConfig.width}%</label><input type="range" min="5" max="80" value={altCropConfig.width} onChange={(e) => setAltCropConfig({...altCropConfig, width: parseInt(e.target.value)})} /></div>
-                <div><label style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)', fontSize: '0.8rem' }}>ความสูง: {altCropConfig.height}%</label><input type="range" min="5" max="80" value={altCropConfig.height} onChange={(e) => setAltCropConfig({...altCropConfig, height: parseInt(e.target.value)})} /></div>
+              <div style={{ flex: 1, minWidth: '220px', background: 'var(--bg-app)', padding: '16px', border: '1px solid var(--border-color)' }}>
+                <strong style={{ color: 'var(--color-primary)', display: 'block', marginBottom: '12px', fontSize: '0.9rem' }}>CH:2 (FALLBACK)</strong>
+                <div style={{ marginBottom: '12px' }}><label style={{ display: 'block', marginBottom: '6px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>WIDTH: {altCropConfig.width}%</label><input type="range" min="5" max="80" value={altCropConfig.width} onChange={(e) => setAltCropConfig({...altCropConfig, width: parseInt(e.target.value)})} /></div>
+                <div><label style={{ display: 'block', marginBottom: '6px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>HEIGHT: {altCropConfig.height}%</label><input type="range" min="5" max="80" value={altCropConfig.height} onChange={(e) => setAltCropConfig({...altCropConfig, height: parseInt(e.target.value)})} /></div>
               </div>
             </div>
 
-            <div style={{ backgroundColor: 'var(--bg-app)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '10px' }}>
-                <strong style={{ color: 'var(--text-main)' }}>จอพรีวิว 3 ระบบ (Tri-Camera Preview)</strong>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>หน้า:</span>
-                  <input type="number" min="1" value={testPageNum} onChange={(e) => setTestPageNum(e.target.value)} style={{ width: '60px', padding: '4px', borderRadius: '4px', border: '1px solid var(--border-color)', background: 'var(--bg-panel)', color: 'var(--text-main)', textAlign: 'center', fontFamily: 'Prompt' }} />
-                  <button onClick={handleTestOcr} disabled={previewData.isLoading || (!masterFile && crFiles.length === 0)} style={{ background: '#3b82f6', color: '#fff', border: 'none', padding: '6px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.75rem', fontWeight: 'bold' }}>
-                    {previewData.isLoading ? '⏳ กำลังวิเคราะห์...' : '🔍 ทดสอบสแกน'}
+            <div style={{ backgroundColor: 'var(--bg-app)', padding: '16px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '10px' }}>
+                <strong style={{ color: 'var(--text-main)', fontSize: '0.9rem' }}>LIVE VISION</strong>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>PAGE:</span>
+                  <input type="number" min="1" value={testPageNum} onChange={(e) => setTestPageNum(e.target.value)} style={{ width: '60px', padding: '4px', border: '1px solid var(--border-color)', background: 'var(--bg-panel)', color: 'var(--text-main)', textAlign: 'center', fontFamily: 'JetBrains Mono', fontSize: '0.85rem' }} />
+                  <button className="btn-run" onClick={handleTestOcr} disabled={previewData.isLoading || (!masterFile && crFiles.length === 0)} style={{ padding: '6px 14px', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}>
+                    {previewData.isLoading ? 'SCANNING...' : 'TEST SCAN'}
                   </button>
                 </div>
               </div>
 
-              {/* 🌟 จอพรีวิว 3 กล้อง */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
-                <div style={{ border: '1px solid var(--border-color)', borderRadius: '8px', padding: '10px', background: 'var(--bg-panel)' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#34d399', marginBottom: '8px', fontWeight: 'bold' }}>กล้อง 1: กรอบหลัก</div>
-                  {previewData.image1 ? <div style={{ textAlign: 'center', marginBottom: '10px', border: '1px dashed #34d399', padding: '5px', background: '#000' }}><img src={previewData.image1} alt="Crop 1" style={{ maxWidth: '100%', maxHeight: '80px' }} /></div> : <div style={{ height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', border: '1px dashed var(--border-color)', fontSize: '0.7rem' }}>รอทดสอบ</div>}
-                  <div style={{ fontSize: '0.7rem', fontFamily: "'JetBrains Mono', monospace", color: previewData.match1.includes('❌') ? '#ef4444' : '#10b981', fontWeight: 'bold' }}>RES: {previewData.match1 || '-'}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px' }}>
+                <div style={{ border: '1px solid var(--border-color)', padding: '12px', background: 'var(--bg-panel)' }}>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--color-up)', marginBottom: '10px', fontWeight: 'bold' }}>CH:1 MAIN</div>
+                  {previewData.image1 ? <div style={{ textAlign: 'center', marginBottom: '10px', background: '#000' }}><img src={previewData.image1} alt="Crop 1" style={{ maxWidth: '100%', maxHeight: '70px' }} /></div> : <div style={{ height: '70px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--border-color)', fontSize: '0.8rem' }}>N/A</div>}
+                  <div style={{ fontSize: '0.85rem', color: previewData.match1.includes('❌') ? 'var(--color-down)' : 'var(--color-up)', fontWeight: 'bold' }}>{previewData.match1}</div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px', wordBreak: 'break-all' }}>RAW: {previewData.rawText1 || '-'}</div>
                 </div>
 
-                <div style={{ border: '1px solid var(--border-color)', borderRadius: '8px', padding: '10px', background: 'var(--bg-panel)' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#c4b5fd', marginBottom: '8px', fontWeight: 'bold' }}>กล้อง 2: กรอบสำรอง</div>
-                  {previewData.image2 ? <div style={{ textAlign: 'center', marginBottom: '10px', border: '1px dashed #c4b5fd', padding: '5px', background: '#000' }}><img src={previewData.image2} alt="Crop 2" style={{ maxWidth: '100%', maxHeight: '80px' }} /></div> : <div style={{ height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', border: '1px dashed var(--border-color)', fontSize: '0.7rem' }}>รอทดสอบ</div>}
-                  <div style={{ fontSize: '0.7rem', fontFamily: "'JetBrains Mono', monospace", color: previewData.match2.includes('❌') ? '#ef4444' : '#10b981', fontWeight: 'bold' }}>RES: {previewData.match2 || '-'}</div>
+                <div style={{ border: '1px solid var(--border-color)', padding: '12px', background: 'var(--bg-panel)' }}>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--color-primary)', marginBottom: '10px', fontWeight: 'bold' }}>CH:2 FALLBACK</div>
+                  {previewData.image2 ? <div style={{ textAlign: 'center', marginBottom: '10px', background: '#000' }}><img src={previewData.image2} alt="Crop 2" style={{ maxWidth: '100%', maxHeight: '70px' }} /></div> : <div style={{ height: '70px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--border-color)', fontSize: '0.8rem' }}>N/A</div>}
+                  <div style={{ fontSize: '0.85rem', color: previewData.match2.includes('❌') ? 'var(--color-down)' : 'var(--color-up)', fontWeight: 'bold' }}>{previewData.match2}</div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px', wordBreak: 'break-all' }}>RAW: {previewData.rawText2 || '-'}</div>
                 </div>
 
-                <div style={{ border: '1px solid var(--border-color)', borderRadius: '8px', padding: '10px', background: 'var(--bg-panel)' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#facc15', marginBottom: '8px', fontWeight: 'bold' }}>กล้อง 3: ค้นหาหน้าปก</div>
-                  {previewData.image3 ? <div style={{ textAlign: 'center', marginBottom: '10px', border: '1px dashed #facc15', padding: '5px', background: '#000' }}><img src={previewData.image3} alt="Cover Crop" style={{ maxWidth: '100%', maxHeight: '80px' }} /></div> : <div style={{ height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', border: '1px dashed var(--border-color)', fontSize: '0.7rem' }}>รอทดสอบ</div>}
-                  <div style={{ fontSize: '0.7rem', fontFamily: "'JetBrains Mono', monospace", color: previewData.match3.includes('❌') ? '#ef4444' : '#10b981', fontWeight: 'bold' }}>RES: {previewData.match3 || '-'}</div>
+                <div style={{ border: '1px solid var(--border-color)', padding: '12px', background: 'var(--bg-panel)' }}>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--color-warning)', marginBottom: '10px', fontWeight: 'bold' }}>CH:3 COVER (TH)</div>
+                  {previewData.image3 ? <div style={{ textAlign: 'center', marginBottom: '10px', background: '#000' }}><img src={previewData.image3} alt="Cover Crop" style={{ maxWidth: '100%', maxHeight: '70px' }} /></div> : <div style={{ height: '70px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--border-color)', fontSize: '0.8rem' }}>N/A</div>}
+                  <div style={{ fontSize: '0.85rem', color: previewData.match3.includes('❌') ? 'var(--color-down)' : 'var(--color-up)', fontWeight: 'bold' }}>{previewData.match3}</div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px', wordBreak: 'break-all' }}>RAW: {previewData.rawText3 ? previewData.rawText3.substring(0,30)+'...' : '-'}</div>
                 </div>
               </div>
             </div>
-            <div style={{ textAlign: 'center' }}>
-              <button className="btn-run" onClick={() => setShowOcrConfig(false)} style={{ padding: '8px 30px', borderRadius: '6px', border: 'none', color: '#fff', fontWeight: '700', cursor: 'pointer', fontSize: '0.85rem' }}>ปิดหน้าต่าง</button>
+            <div style={{ textAlign: 'right' }}>
+              <button className="btn-secondary" onClick={() => setShowOcrConfig(false)} style={{ padding: '8px 24px', cursor: 'pointer', fontSize: '0.9rem', fontWeight: 'bold' }}>CLOSE</button>
             </div>
           </div>
         </div>
@@ -628,120 +767,156 @@ ${logs.join('\n')}
         <div className="modal-overlay" onClick={() => setShowHelp(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <button className="modal-close" onClick={() => setShowHelp(false)}>✖</button>
-            <h2 style={{ margin: '0 0 20px 0', fontSize: '1.4rem', color: '#3b82f6', display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <span>📖</span> คู่มือการใช้งานระบบ
+            <h2 style={{ margin: '0 0 20px 0', fontSize: '1.4rem', color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '10px', fontFamily: "'Prompt', sans-serif" }}>
+              <span>📖</span> MANUAL
             </h2>
-            <div style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: '1.7' }}>
-              <p>ใส่ไฟล์ <b>Master PDF</b> ช่องซ้าย และ <b>ไฟล์ CR</b> ช่องขวา แล้วกด <b>SCAN & REVIEW</b></p>
-              <div style={{ backgroundColor: 'var(--bg-app)', padding: '16px', borderRadius: '10px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
-                <strong style={{ color: 'var(--text-main)', display: 'block', marginBottom: '10px' }}>ความหมายของป้ายสถานะ:</strong>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', fontSize: '0.85rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ color: '#34d399' }}>🔄 สีเขียว:</span> สลับทับแผ่นเดิม</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ color: '#c4b5fd' }}>➕ สีม่วง:</span> เพิ่มเป็นแบบใหม่ท้ายเล่ม (หน้าปกจะอยู่หน้าสุดเสมอ)</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ color: '#facc15' }}>🗑️ สีเหลือง:</span> ลบทิ้ง (หน้าปก/ขยะ)</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span style={{ color: '#fde047' }}>⏳ สีน้ำตาล:</span> กำลังสแกนหาใน Master</div>
+            <div style={{ fontSize: '0.95rem', color: 'var(--text-muted)', lineHeight: '1.6', fontFamily: "'Prompt', sans-serif" }}>
+              <p>Upload <b>MASTER PDF</b> (Left) and <b>CR FILES</b> (Right) then click <b>EXECUTE</b>.<br/>
+              <span style={{ color: 'var(--color-down)' }}>(Note: Excluded categories will be purged automatically)</span></p>
+              <div style={{ backgroundColor: 'var(--bg-app)', padding: '20px', border: '1px solid var(--border-color)', marginBottom: '20px' }}>
+                <strong style={{ display: 'block', marginBottom: '12px', fontSize: '1rem' }}>ORDER BOOK STATUS:</strong>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', fontSize: '0.9rem', fontFamily: "'JetBrains Mono', monospace" }}>
+                  <div style={{ color: 'var(--color-up)' }}>[UPDT] REPLACED</div>
+                  <div style={{ color: 'var(--color-primary)' }}>[INSR] APPENDED</div>
+                  <div style={{ color: 'var(--color-down)' }}>[DROP] PURGED</div>
                 </div>
               </div>
             </div>
-            <div style={{ textAlign: 'center' }}>
-              <button className="btn-run" onClick={() => setShowHelp(false)} style={{ padding: '10px 30px', borderRadius: '8px', border: 'none', color: '#fff', fontWeight: '700', cursor: 'pointer' }}>เข้าใจแล้ว</button>
+            <div style={{ textAlign: 'right' }}>
+              <button className="btn-secondary" onClick={() => setShowHelp(false)} style={{ padding: '8px 24px', cursor: 'pointer', fontSize: '0.9rem', fontWeight: 'bold' }}>ACKNOWLEDGE</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* โครงสร้างหลักของแอป */}
-      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', maxWidth: '1200px', gap: '16px', height: '100%' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', maxWidth: '1024px', gap: '16px', height: '100%' }}>
 
-        <div className="glass-panel" style={{ padding: '20px', display: 'flex', alignItems: 'stretch', gap: '20px', flexShrink: 0 }}>
+        {/* 🌟 Header & Control Panel */}
+        <div className="glass-panel" style={{ padding: '20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, gap: '20px' }}>
           
-          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', minWidth: '220px' }}>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                <span style={{ fontSize: '1.6rem', textShadow: '0 0 10px rgba(59,130,246,0.5)' }}>⚡</span>
-                <h1 style={{ margin: 0, fontSize: '1.1rem', fontWeight: '800', letterSpacing: '0.5px' }}>PDF BATCH REPLACER</h1>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', paddingLeft: '34px' }}>
-                <span style={{ backgroundColor: '#3b82f6', color: '#fff', fontSize: '0.6rem', padding: '2px 6px', borderRadius: '4px', fontWeight: '700' }}>@The Toi</span>
-                <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>Auto-Append & Sort</span>
-              </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '40px', height: '40px', background: 'var(--color-primary)', color: '#fff', fontWeight: 'bold', fontSize: '1.2rem' }}>
+              PBR
             </div>
-            
-            <div style={{ display: 'flex', gap: '6px', paddingLeft: '34px', marginTop: '12px', flexWrap: 'wrap' }}>
-              <button className="btn-tool" onClick={() => setShowHelp(true)}>📖 วิธีใช้</button>
-              <button className="btn-tool" onClick={() => setShowOcrConfig(true)} style={{ color: '#10b981', borderColor: 'var(--border-color)' }}>⚙️ ตั้งค่า OCR</button>
-              <button className={`btn-tool ${!isDarkMode ? 'active' : ''}`} onClick={() => setIsDarkMode(!isDarkMode)}>
-                {isDarkMode ? '☀️ สว่าง' : '🌙 มืด'}
-              </button>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '6px' }}>
+                <h1 style={{ margin: 0, fontSize: '1.3rem', fontWeight: '800', letterSpacing: '1px' }}>PDF BATCH REPLACER</h1>
+                <span className="badge-primary">v4.1</span>
+              </div>
+              
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontWeight: 'bold', marginRight: '4px' }}>FILTER:</span>
+                {CATEGORIES.map(cat => (
+                  <button 
+                    key={cat}
+                    onClick={() => !isProcessing && setActiveCategories(prev => ({...prev, [cat]: !prev[cat]}))}
+                    className={`cat-toggle ${activeCategories[cat] ? 'active' : 'inactive'}`}
+                    disabled={isProcessing}
+                    title={activeCategories[cat] ? `Include ${cat}` : `Exclude ${cat}`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+
             </div>
           </div>
+          
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button className="btn-tool" onClick={() => setShowHelp(true)}>MANUAL</button>
+            <button className="btn-tool btn-ocr" onClick={() => setShowOcrConfig(true)}>OCR_CFG</button>
+            <button className={`btn-tool ${!isDarkMode ? 'active' : ''}`} onClick={() => setIsDarkMode(!isDarkMode)}>
+              {isDarkMode ? 'LIGHT' : 'DARK'}
+            </button>
+            <button className="btn-tool btn-reset" onClick={handleReset}>RESET</button>
+          </div>
+        </div>
 
-          <div style={{ width: '1px', backgroundColor: 'var(--border-color)', margin: '0 5px' }}></div>
-
-          <div style={{ display: 'flex', gap: '16px', flex: 1 }}>
-            
-            <div 
-              className={`upload-box ${dragMaster ? 'drag-active' : ''}`} 
-              style={{ flex: 1, padding: '12px 16px', borderRadius: '8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '10px' }}
-              onDragOver={(e) => { e.preventDefault(); setDragMaster(true); }}
-              onDragLeave={() => setDragMaster(false)}
-              onDrop={(e) => { e.preventDefault(); setDragMaster(false); if(e.dataTransfer.files.length) setMasterFile(e.dataTransfer.files[0]); }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-main)', fontWeight: '700', letterSpacing: '0.5px' }}>1. MASTER PDF</span>
-                {masterFile ? <span style={{ fontSize: '0.7rem', color: '#10b981', fontWeight: '600' }}>✓ READY</span> : <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Drag & Drop</span>}
-              </div>
-              <input type="file" accept="application/pdf" onChange={(e) => setMasterFile(e.target.files[0])} disabled={isProcessing} style={{ fontSize: '0.75rem', color: 'var(--text-muted)', width: '100%' }} />
+        {/* 🌟 Upload & Action Area */}
+        <div style={{ display: 'flex', gap: '16px', flexShrink: 0 }}>
+          <div 
+            className={`upload-box ${dragMaster ? 'drag-active' : ''}`} 
+            style={{ flex: 1, padding: '20px', display: 'flex', flexDirection: 'column', gap: '12px' }}
+            onDragOver={(e) => { e.preventDefault(); setDragMaster(true); }}
+            onDragLeave={() => setDragMaster(false)}
+            onDrop={(e) => { e.preventDefault(); setDragMaster(false); if(e.dataTransfer.files.length) setMasterFile(e.dataTransfer.files[0]); }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.9rem', color: 'var(--text-main)', fontWeight: '700', letterSpacing: '0.5px' }}>[1] MASTER_PDF</span>
+              {masterFile ? <span style={{ fontSize: '0.85rem', color: 'var(--color-up)', fontWeight: 'bold' }}>CONNECTED</span> : <span style={{ fontSize: '0.8rem', color: 'var(--border-color)' }}>AWAITING</span>}
             </div>
+            <input key={resetKey || 'master'} type="file" accept="application/pdf" onChange={(e) => setMasterFile(e.target.files[0])} disabled={isProcessing} style={{ width: '100%' }} />
+          </div>
 
-            <div 
-              className={`upload-box ${dragCr ? 'drag-active' : ''}`} 
-              style={{ flex: 1, padding: '12px 16px', borderRadius: '8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '10px' }}
-              onDragOver={(e) => { e.preventDefault(); setDragCr(true); }}
-              onDragLeave={() => setDragCr(false)}
-              onDrop={(e) => { e.preventDefault(); setDragCr(false); if(e.dataTransfer.files.length) setCrFiles(Array.from(e.dataTransfer.files)); }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-main)', fontWeight: '700', letterSpacing: '0.5px' }}>2. CR FILES (MULTI)</span>
-                {crFiles.length > 0 ? <span style={{ fontSize: '0.7rem', color: '#3b82f6', fontWeight: '700' }}>{crFiles.length} FILES</span> : <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>Drag & Drop</span>}
+          <div 
+            className={`upload-box ${dragCr ? 'drag-active' : ''}`} 
+            style={{ flex: 1, padding: '20px', display: 'flex', flexDirection: 'column', gap: '12px' }}
+            onDragOver={(e) => { e.preventDefault(); setDragCr(true); }}
+            onDragLeave={() => setDragCr(false)}
+            onDrop={(e) => { e.preventDefault(); setDragCr(false); if(e.dataTransfer.files.length) setCrFiles(Array.from(e.dataTransfer.files)); }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <span style={{ fontSize: '0.9rem', color: 'var(--text-main)', fontWeight: '700', letterSpacing: '0.5px' }}>[2] CR_MULTIPLES</span>
+                {crFiles.length > 0 && (
+                  <button 
+                    onClick={(e) => { e.preventDefault(); handleCopyCrNames(); }}
+                    style={{ 
+                      background: 'var(--bg-panel)', border: '1px solid var(--border-color)', color: copied ? 'var(--color-up)' : 'var(--text-muted)', 
+                      padding: '2px 6px', borderRadius: '4px', fontSize: '0.65rem', cursor: 'pointer', fontFamily: 'JetBrains Mono', fontWeight: 'bold', transition: 'all 0.2s'
+                    }}
+                    title="Copy File Names"
+                  >
+                    {copied ? '✅ COPIED' : '📋 COPY'}
+                  </button>
+                )}
               </div>
-              <input type="file" multiple accept="application/pdf" onChange={(e) => setCrFiles(Array.from(e.target.files))} disabled={isProcessing} style={{ fontSize: '0.75rem', color: 'var(--text-muted)', width: '100%' }} />
+              {crFiles.length > 0 ? <span style={{ fontSize: '0.85rem', color: 'var(--color-primary)', fontWeight: 'bold' }}>{crFiles.length} DETECTED</span> : <span style={{ fontSize: '0.8rem', color: 'var(--border-color)' }}>AWAITING</span>}
             </div>
-
+            <input key={(resetKey + 1) || 'cr'} type="file" multiple accept="application/pdf" onChange={(e) => setCrFiles(Array.from(e.target.files))} disabled={isProcessing} style={{ width: '100%' }} />
           </div>
 
           <button 
             className="btn-run"
             onClick={handleScanFiles} 
             disabled={!masterFile || crFiles.length === 0 || isProcessing || reviewData} 
-            style={{ padding: '0 24px', borderRadius: '8px', border: 'none', color: '#fff', fontWeight: '700', fontSize: '1rem', cursor: 'pointer', minWidth: '160px', letterSpacing: '1px', alignSelf: 'stretch' }}
+            style={{ 
+              padding: '0 36px', 
+              border: 'none', 
+              color: '#fff', 
+              fontSize: '1.1rem', 
+              fontWeight: 'bold',
+              minWidth: '200px',
+              letterSpacing: '1.5px'
+            }}
           >
-            {isProcessing ? `${progress}%` : '🚀 SCAN & REVIEW'}
+            {isProcessing ? `${progress}%...` : 'EXECUTE'}
           </button>
         </div>
 
+        {/* 🌟 Dashboard (สไตล์ Order Book) */}
         {(crSummary.length > 0 || downloadUrl) && (
-          <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', flexShrink: 0 }}>
+          <div style={{ display: 'flex', gap: '16px', flexShrink: 0, minHeight: '160px' }}>
             {crSummary.length > 0 && (
               <div className="glass-panel" style={{ flex: 3, padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: '700', letterSpacing: '1px', display: 'flex', justifyContent: 'space-between' }}>
-                  <span>📊 LIVE TRACKING DASHBOARD ({crSummary.length} ITEMS)</span>
-                  {isProcessing && <span style={{ color: '#eab308' }}>SYNCING...</span>}
+                <div style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>
+                  <span>ORDER_BOOK (ITEMS: {crSummary.length})</span>
+                  {isProcessing && <span style={{ color: 'var(--color-warning)' }}>SYNCING...</span>}
                 </div>
                 
-                <div className="terminal-scroll" style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', maxHeight: '85px', overflowY: 'auto' }}>
+                <div className="terminal-scroll" style={{ display: 'flex', flexWrap: 'wrap', alignContent: 'flex-start', gap: '6px', flex: 1, overflowY: 'auto' }}>
                   {crSummary.map((item, idx) => {
-                    let bg = '#1e293b', text = '#94a3b8', border = '#334155', icon = '';
-                    if (item.status === 'success') { bg = '#064e3b'; text = '#34d399'; border = '#059669'; icon = '🔄'; }
-                    else if (item.status === 'new_append') { bg = '#4c1d95'; text = '#c4b5fd'; border = '#7c3aed'; icon = '➕'; }
-                    else if (item.status === 'searching') { bg = '#713f12'; text = '#fde047'; border = '#ca8a04'; icon = '⏳'; }
+                    let color = 'var(--text-muted)';
+                    let prefix = '';
+                    if (item.status === 'success') { color = 'var(--color-up)'; prefix = 'UPDT'; }
+                    else if (item.status === 'new_append') { color = 'var(--color-primary)'; prefix = 'INSR'; }
+                    else if (item.status === 'searching') { color = 'var(--color-warning)'; prefix = 'WAIT'; }
 
                     return (
                       <div key={idx} className={item.status === 'searching' ? 'status-searching' : ''} style={{ 
-                        padding: '4px 10px', borderRadius: '6px', fontSize: '0.8rem', fontWeight: '600',
-                        backgroundColor: bg, color: text, border: `1px solid ${border}`, display: 'flex', gap: '4px', alignItems: 'center'
+                        padding: '4px 8px', fontSize: '0.85rem', fontWeight: 'bold', color: color, borderLeft: `3px solid ${color}`, background: 'var(--upload-bg)', display: 'flex', gap: '8px', minWidth: '130px'
                       }}>
-                        <span>{icon}</span> {item.dwgNo === 'COVER' ? 'หน้าปก (COVER)' : item.dwgNo}
+                        <span style={{ opacity: 0.6 }}>[{prefix}]</span> {item.dwgNo === 'COVER' ? 'COVER_PAGE' : item.dwgNo}
                       </div>
                     );
                   })}
@@ -750,18 +925,19 @@ ${logs.join('\n')}
             )}
 
             {downloadUrl && (
-              <div className="glass-panel" style={{ flex: 1, padding: '16px', display: 'flex', flexDirection: 'column', justifyContent: 'center', border: '1px solid #10b981', backgroundColor: 'rgba(16, 185, 129, 0.05)' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '10px', fontSize: '0.8rem', fontWeight: '600' }}>
-                  <span style={{ color: '#34d399' }}>🔄 Replaced: {stats.replaced}</span>
-                  <span style={{ color: '#c4b5fd' }}>➕ Appended: {stats.appended}</span>
-                  <span style={{ color: '#facc15' }}>🗑️ Purged: {stats.purged}</span>
+              <div className="glass-panel" style={{ flex: 1, padding: '16px', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', border: '1px solid var(--color-up)' }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--text-muted)', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px' }}>EXECUTION_SUMMARY</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.9rem', fontWeight: 'bold', fontFamily: "'JetBrains Mono', monospace" }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>REPLACED:</span><span style={{ color: 'var(--color-up)' }}>{stats.replaced}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>APPENDED:</span><span style={{ color: 'var(--color-primary)' }}>{stats.appended}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>PURGED:</span><span style={{ color: 'var(--color-down)' }}>{stats.purged}</span></div>
                 </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <a href={downloadUrl} download={downloadFilename} style={{ flex: 2, textAlign: 'center', padding: '8px 0', borderRadius: '6px', textDecoration: 'none', color: '#fff', fontSize: '0.8rem', fontWeight: '700', backgroundColor: '#10b981', transition: 'all 0.2s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
-                    📥 LOAD PDF
+                <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                  <a href={downloadUrl} download={downloadFilename} className="btn-run" style={{ flex: 2, textAlign: 'center', padding: '8px 0', textDecoration: 'none', color: '#fff', fontSize: '0.85rem', fontWeight: 'bold', background: 'var(--color-up)' }}>
+                    EXPORT_PDF
                   </a>
-                  <button onClick={exportLogReport} className="btn-secondary" style={{ flex: 1, padding: '8px 0', borderRadius: '6px', fontSize: '0.8rem', fontWeight: '700', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
-                    📝 LOG
+                  <button onClick={exportLogReport} className="btn-secondary" style={{ flex: 1, padding: '8px 0', fontSize: '0.85rem', fontWeight: 'bold', cursor: 'pointer' }}>
+                    LOG
                   </button>
                 </div>
               </div>
@@ -769,46 +945,25 @@ ${logs.join('\n')}
           </div>
         )}
 
+        {/* 🌟 Terminal / Log Area */}
         <div className="glass-panel" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          
-          <div style={{ width: '100%', height: '3px', backgroundColor: 'var(--border-color)' }}>
-            <div style={{ 
-              width: `${progress}%`, height: '100%', 
-              backgroundColor: '#38bdf8', 
-              boxShadow: '0 0 10px #38bdf8, 0 0 5px #38bdf8', 
-              transition: 'width 0.4s ease-out' 
-            }}></div>
-          </div>
-
-          <div style={{ padding: '10px 16px', backgroundColor: '#020617', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#ef4444' }}></div>
-              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#eab308' }}></div>
-              <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: '#22c55e' }}></div>
-              <span style={{ fontSize: '0.75rem', color: '#94a3b8', marginLeft: '12px', letterSpacing: '1px', fontFamily: "'JetBrains Mono', monospace" }}>
-                AI_CORE_TERMINAL_V4 // ระบบอัปเดตและจัดเรียงแบบ
-              </span>
-            </div>
-            <span style={{ fontSize: '0.65rem', color: '#3b82f6', letterSpacing: '1px', fontFamily: "'JetBrains Mono', monospace", opacity: 0.8 }}>
-              SYS.AUTH: @The Toi
-            </span>
+          <div style={{ width: '100%', height: '3px', background: 'var(--border-color)' }}>
+            <div style={{ width: `${progress}%`, height: '100%', background: 'var(--color-primary)', transition: 'width 0.2s' }}></div>
           </div>
           
-          <div className="terminal-scroll" style={{ flex: 1, padding: '20px', overflowY: 'auto', fontFamily: "'JetBrains Mono', monospace", fontSize: '0.85rem', lineHeight: '1.6', backgroundColor: '#0f172a' }}>
+          <div className="terminal-scroll" style={{ flex: 1, padding: '16px', overflowY: 'auto', fontSize: '0.9rem', lineHeight: '1.6', background: 'var(--upload-bg)' }}>
             {logs.map((log, i) => {
-              let logColor = '#38bdf8'; 
-              if (log.includes('✅') || log.includes('🎉') || log.includes('🎯')) logColor = '#4ade80'; 
-              if (log.includes('❌') || log.includes('🚨') || log.includes('⚠️')) logColor = '#f43f5e'; 
-              if (log.includes('⏩') || log.includes('⏳')) logColor = '#94a3b8'; 
-              if (log.includes('🗑️') || log.includes('🧹')) logColor = '#facc15'; 
-              if (log.includes('➕') || log.includes('🆕')) logColor = '#c084fc'; 
-              if (log.includes('⏸️')) logColor = '#eab308'; 
-              if (log.includes('💾') || log.includes('🛡️')) logColor = '#facc15'; 
+              let logColor = 'var(--text-muted)'; 
+              if (log.includes('[+]') || log.includes('MATCH')) logColor = 'var(--color-up)'; 
+              if (log.includes('[-]') || log.includes('ERR') || log.includes('DROP') || log.includes('ABORT')) logColor = 'var(--color-down)'; 
+              if (log.includes('NEW_ENTRY') || log.includes('EXEC')) logColor = 'var(--color-primary)'; 
+              if (log.includes('SYS') || log.includes('IDX') || log.includes('DATA')) logColor = 'var(--text-main)'; 
+              if (log.includes('LOCKED') || log.includes('PAUSE') || log.includes('FORCE')) logColor = 'var(--color-warning)'; 
               
-              return <div key={i} style={{ marginBottom: '4px', whiteSpace: 'pre-wrap', color: logColor }}>{log}</div>;
+              return <div key={i} style={{ color: logColor }}>{log}</div>;
             })}
             <div ref={logEndRef} />
-            {!logs.length && <div style={{ color: '#64748b' }}>&gt; ระบบพร้อมทำงาน. ลากไฟล์มาวางที่กล่องด้านบนเพื่อเริ่มต้น...</div>}
+            {!logs.length && <div style={{ color: 'var(--text-muted)' }}>{'>'} STATUS: STANDBY</div>}
           </div>
         </div>
 
