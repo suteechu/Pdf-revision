@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-  base: '/Pdf-revision/',
+  base: '/FloorPlan-Revised-CR-Auto/',
   build: {
     chunkSizeWarningLimit: 2000, // ขยายลิมิตคำเตือนเป็น 2000 kB เพราะเราใช้ AI
     rollupOptions: {
